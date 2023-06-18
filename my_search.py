@@ -234,14 +234,20 @@ gradients_like = tf.nest.map_structure(lambda g: tf.zeros_like(g), model.trainab
     ]
 )
 def step2_cal_JVP_vStep(images_aug2, labels, weight_1, weights_2):
+    # ! images_aug: [num_data, *img_size]
+    # ! labels: [num_data]
+    # ! weight_1: []
+    # ! weights_2: [num_data]
     if not args.debug:
         print("*" * 40 + " retracing step2_cal_JVP_vStep " + "*" * 40)
     with tf.GradientTape() as tape:
         labels_aug_pred = model(images_aug2, training=False)
-        loss_aug = train_loss_fun(labels, labels_aug_pred)
+        loss_aug = train_loss_fun(labels, labels_aug_pred)  # ! [num_data]
     grad_new = tape.gradient(loss_aug, model.trainable_variables, output_gradients=weights_2 * weight_1)
+    # ! => 각 data point에 대한 [dL/dx_1 * w2_1, dL/dx_2 * w2_2, ...] * w1
     del tape
     return grad_new
+    ###
 
 
 @tf.function(
@@ -254,6 +260,11 @@ def step2_cal_JVP_vStep(images_aug2, labels, weight_1, weights_2):
     ]
 )
 def step2_cal_JVP_jvpStep(images_aug2, labels, g_norm_train, g_norm_val, tangents):
+    # ! images_aug2: [num_data, *img_size]
+    # ! labels: [num_data]
+    # ! g_norm_train: []
+    # ! g_norm_val: []
+    # ! tangents: grad
     if not args.debug:
         print("*" * 40 + " retracing step2_cal_JVP_jStep " + "*" * 40)
     with tf.autodiff.ForwardAccumulator(primals=model.trainable_variables, tangents=tangents) as acc:
@@ -266,15 +277,23 @@ def step2_cal_JVP_jvpStep(images_aug2, labels, g_norm_train, g_norm_val, tangent
 
 @tf.function
 def policy_gradient_stage1(reduce_random_mat, images_aug, labels_aug, images_val, labels_val, weight_1, weights_2):
-    reduce_random_mat = tf.squeeze(reduce_random_mat)
-    images_aug = tf.squeeze(images_aug)
-    labels_aug = tf.squeeze(labels_aug)
-    images_val = tf.squeeze(images_val)
-    labels_val = tf.squeeze(labels_val)
-    weight_1 = tf.squeeze(weight_1)
-    weights_2 = tf.squeeze(weights_2)
+    #         tf.constant(reduce_random_mat, dtype=tf.float32), # ! [T, T], np.eye(T)
+    #         tf.convert_to_tensor(images_aug_last[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32), # ! [T, *img_size]
+    #         tf.convert_to_tensor(labels_aug_last[ctx.replica_id_in_sync_group + used_batch], dtype=tf.int32), # ! [T]
+    #         tf.convert_to_tensor(images_val_[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32), # ! [val_bs, *img_size]
+    #         tf.convert_to_tensor(labels_val_[ctx.replica_id_in_sync_group + used_batch], dtype=tf.int32), # ! [val_bs]
+    #         tf.convert_to_tensor(weights_1[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32), # ! [], = 1
+    #         tf.constant(weights_2, dtype=tf.float32), # ! [T], = p_theta
 
-    bs = _PARALLEL_BATCH
+    reduce_random_mat = tf.squeeze(reduce_random_mat)  # ! [T, T], np.eye(T)
+    images_aug = tf.squeeze(images_aug)  # ! [T, *img_size]
+    labels_aug = tf.squeeze(labels_aug)  # ! [T]
+    images_val = tf.squeeze(images_val)  # ! [val_bs, *img_size]
+    labels_val = tf.squeeze(labels_val)  # ! [val_bs]
+    weight_1 = tf.squeeze(weight_1)  # ! [], = 1
+    weights_2 = tf.squeeze(weights_2)  # ! [T], = p_theta
+
+    bs = _PARALLEL_BATCH  # ! 16 or 128 or 256
     val_bs = tf.shape(images_val)[0]
     mult = tf.cast(val_bs, dtype=tf.float32)
 
@@ -288,23 +307,48 @@ def policy_gradient_stage1(reduce_random_mat, images_aug, labels_aug, images_val
 
     # 1) Step1: Get gradients of augmented and clean data
     def one_batch_grad(imgs, labs, w1, w2, grad):
+        # ! imgs: [bs, *img_size], labs: [bs], w1: [], w2: [bs]
         grad_new = step2_cal_JVP_vStep(imgs, labs, w1, w2)
         grad = tf.nest.map_structure(lambda g1, g2: g1 + g2, grad, grad_new)
         return grad
 
     @tf.function
     def cal_grad(imgs, labs, w1, w2):
-        L = tf.shape(imgs)[0]
+        """
+        - imgs를 _PARALLEL_BATCH 단위로 나눠서 grad를 계산하고 그 합을 출력
+        - 한 _PARALLEL_BATCH의 grad는 step2_cal_JVP_vStep 함수로 계산
+        - step2_cal_JVP_vStep 함수는 tf.GradientTape로 grad를 계산
+        - loss_fn = SparseCategoricalCrossentropy(reduction=None)
+            grad_new = tape.gradient(loss_aug, model.trainable_variables, output_gradients=weights_2 * weight_1)
+        - output_gradients = w2 * w1
+            - in pytorch,
+                - grad_outputs = The “vector” in the vector-Jacobian product. Usually gradients w.r.t. each output.
+                - [dL/dy_1, dL/dy_2, ..., dL/dy_m]
+                - => v * J = [dL/dx_1, dL/dx_2, ..., dL/dx_n]
+        - ou
+        # TODO: w1, w2의 의미를 알아보자.
+
+        Args:
+            imgs (_type_): [num_data, *img_size]
+            labs (_type_): [num_data]
+            w1 (_type_): [1]
+            w2 (_type_): [num_data]
+
+        Returns:
+            _type_: _description_
+        """
+        L = tf.shape(imgs)[0]  # ! num_data
         grad0 = tf.nest.map_structure(lambda g: tf.zeros_like(g), model.trainable_variables)
         grad, _ = tf.while_loop(
             cond=lambda grad_acc, k: tf.cast(k, dtype=tf.int32)
             < tf.cast(tf.math.ceil(tf.cast(L, dtype=tf.float32) / tf.cast(bs, dtype=tf.float32)), dtype=tf.int32),
+            # ! cond = k < ceil(num_data/_PARALLEL_BATCH)
             body=lambda grad_acc, k: (
-                one_batch_grad(
-                    imgs[batching(L, bs, k)[0] : batching(L, bs, k)[1]],
-                    labs[batching(L, bs, k)[0] : batching(L, bs, k)[1]],
-                    w1,
-                    w2[batching(L, bs, k)[0] : batching(L, bs, k)[1]],
+                one_batch_grad(  # ! calculate gradients of one _PARALLEL_BATCH
+                    imgs[batching(L, bs, k)[0] : batching(L, bs, k)[1]],  # ! [_PARALLEL_BATCH, *img_size]
+                    labs[batching(L, bs, k)[0] : batching(L, bs, k)[1]],  # ! [_PARALLEL_BATCH]
+                    w1,  # ! []
+                    w2[batching(L, bs, k)[0] : batching(L, bs, k)[1]],  # ! [_PARALLEL_BATCH]
                     grad_acc,
                 ),
                 k + 1,
@@ -316,10 +360,10 @@ def policy_gradient_stage1(reduce_random_mat, images_aug, labels_aug, images_val
         return grad
 
     grad_val = cal_grad(
-        images_val,
-        labels_val,
-        tf.constant(1.0, dtype=tf.float32),
-        tf.ones(val_bs, dtype=tf.float32) / tf.cast(val_bs, dtype=tf.float32),
+        images_val,  # ! [val_bs, *img_size]
+        labels_val,  # ! [val_bs]
+        tf.constant(1.0, dtype=tf.float32),  # ! [], = 1
+        tf.ones(val_bs, dtype=tf.float32) / tf.cast(val_bs, dtype=tf.float32),  # ! [val_bs], = [1 / val_bs, ...]
     )
     grad_train = cal_grad(images_aug, labels_aug, weight_1 * mult, weights_2)
     grad_train = tf.nest.map_structure(lambda g: g / mult, grad_train)  # for numerical stability
@@ -339,18 +383,19 @@ def policy_gradient_stage1(reduce_random_mat, images_aug, labels_aug, images_val
 
     @tf.function
     def run_JVP(imgs, labs):
-        L = tf.shape(imgs)[0]
+        T = tf.shape(imgs)[0]
         grad_importance_array = tf.TensorArray(
             tf.float32, size=0, dynamic_size=True, infer_shape=False, element_shape=[None]
         )
         grad_importance_array, _ = tf.while_loop(
             cond=lambda grad_TA, k: tf.cast(k, dtype=tf.int32)
-            < tf.cast(tf.math.ceil(tf.cast(L, dtype=tf.float32) / tf.cast(bs, dtype=tf.float32)), dtype=tf.int32),
+            < tf.cast(tf.math.ceil(tf.cast(T, dtype=tf.float32) / tf.cast(bs, dtype=tf.float32)), dtype=tf.int32),
+            # ! cond = k < ceil(T/_PARALLEL_BATCH)
             body=lambda grad_TA, k: (
                 one_step_JVP(
                     grad_TA,
-                    imgs[batching(L, bs, k)[0] : batching(L, bs, k)[1]],
-                    labs[batching(L, bs, k)[0] : batching(L, bs, k)[1]],
+                    imgs[batching(T, bs, k)[0] : batching(T, bs, k)[1]],  # ! [_PARALLEL_BATCH, *img_size]
+                    labs[batching(T, bs, k)[0] : batching(T, bs, k)[1]],  # ! [_PARALLEL_BATCH]
                     k,
                 ),
                 k + 1,
@@ -359,9 +404,9 @@ def policy_gradient_stage1(reduce_random_mat, images_aug, labels_aug, images_val
             back_prop=False,
             parallel_iterations=1,
         )
-        return grad_importance_array.concat()
+        return grad_importance_array.concat() # ! [T, ??]
 
-    grad_importance = run_JVP(images_aug, labels_aug)
+    grad_importance = run_JVP(images_aug, labels_aug)  # # ! [T, *img_size], [T]
 
     if args.repeat_random_ops:
         grad_importance = tf.matmul(grad_importance[tf.newaxis], reduce_random_mat, transpose_b=True)[0]
@@ -508,33 +553,50 @@ def train_policy_stage1(stage, images_val_, labels_val_, images_batch, labels_ba
     val_bs = len(images_val_[0])
     assert search_bs == len(images_batch), "Check dimensions"
     assert len(images_val_) % search_bs == 0, "Use different validation batch for different search data point"
+    # ! images_val_ : [search_bs, val_bs, *img_size]
+    # ! labels_val_ : [search_bs, val_bs]
+    # ! images_batch : [search_bs, 1, *img_size]
+    # ! labels_batch : [search_bs, 1]
 
     EXP = 1  # expansion factor
     images_val_, labels_val_ = augmentation_test(
-        sum(images_val_, []),
-        np.concatenate(labels_val_),
-        np.array([[0]] * search_bs * val_bs, dtype=np.int32),
-        np.array([[0]] * search_bs * val_bs, dtype=np.float32) / float(args.l_mags - 1),
+        sum(images_val_, []),  # ! : [search_bs * val_bs, *img_size]
+        np.concatenate(labels_val_),  # ! : [search_bs * val_bs]
+        np.array([[0]] * search_bs * val_bs, dtype=np.int32),  # ! : [search_bs * val_bs, 1]
+        np.array([[0]] * search_bs * val_bs, dtype=np.float32) / float(args.l_mags - 1),  # ! : [search_bs * val_bs, 1]
         use_post_aug=True,
         pool=pool,
         chunksize=args.chunk_size,
     )
+    # ! images_val_ : [search_bs, val_bs, *img_size] -> [search_bs * val_bs, *img_size]
+    # ! labels_val_ : [search_bs, val_bs] -> [search_bs * val_bs]
 
     images_val_ = np.reshape(images_val_, [search_bs, val_bs, *args.img_size])
     labels_val_ = np.reshape(labels_val_, [search_bs, val_bs])
+    # ! images_val_ : [search_bs * val_bs, val_bs, *img_size] -> [search_bs, val_bs, *img_size]
+    # ! labels_val_ : [search_bs * val_bs] -> [search_bs, val_bs]
 
     images_batch = repeat(images_batch, EXP, axis=0)
     labels_batch = repeat(labels_batch, EXP, axis=0)
+    # ! images_batch : [search_bs, 1, *img_size] -> [search_bs * EXP, 1, *img_size]
+    # ! labels_batch : [search_bs, 1] -> [search_bs * EXP, 1]
 
     ops_dense, mags_dense, reduce_random_mat, ops_mags_idx, probs, probs_exp = all_using_policies[
         stage - 1
-    ].get_dense_aug(None, args.repeat_random_ops)
+    ].get_dense_aug(
+        None, args.repeat_random_ops
+    )  # None, False
+    # ! reduce_random_mat : [T, T], np.eye(T)
+    # ! probs : [T], softmax된 값
+    # ! probs_exp == probs : [T], softmax된 값
+
     if isinstance(images_batch[0], list):
         images_aug_last, labels_aug_last = augmentation_search(
-            repeat(sum(images_batch, []), len(ops_dense), axis=0),
-            repeat(np.concatenate(labels_batch), len(ops_dense), axis=0),
-            np.tile(ops_dense, [search_bs * EXP, 1]),
-            np.tile(mags_dense, [search_bs * EXP, 1]).astype(np.float32) / float(args.l_mags - 1),
+            repeat(sum(images_batch, []), len(ops_dense), axis=0),  # ! : [search_bs * EXP * T, *img_size]
+            repeat(np.concatenate(labels_batch), len(ops_dense), axis=0),  # ! : [search_bs * EXP * T]
+            np.tile(ops_dense, [search_bs * EXP, 1]),  # ! : [search_bs * EXP * T, 1]
+            np.tile(mags_dense, [search_bs * EXP, 1]).astype(np.float32)
+            / float(args.l_mags - 1),  # ! : [search_bs * EXP * T, 1]
             use_post_aug=False,
             pool=pool,
             chunksize=None,
@@ -542,28 +604,39 @@ def train_policy_stage1(stage, images_val_, labels_val_, images_batch, labels_ba
 
     images_aug_last = np.reshape(images_aug_last, [-1, len(ops_dense), *args.img_size])
     labels_aug_last = np.reshape(labels_aug_last, [-1, len(ops_dense)])
+    # ! images_aug_last : [search_bs * EXP, T, *img_size]
+    # ! labels_aug_last : [search_bs * EXP, T]
 
     weights_1 = np.ones(search_bs * EXP, dtype=np.float32)
     weights_2 = probs_exp
+    # ! weights_1 : [search_bs * EXP], np.array([1, ..., 1])
+    # ! weights_2 : [T], = p_theta
 
-    assert (
-        search_bs % mirrored_strategy.num_replicas_in_sync == 0
-    ), "Make sure that search_bs is multiples of mirrored_trategy"
-    all_local_cos_sim, all_local_grad_importance = [], []
-    for used_batch in range(0, search_bs, mirrored_strategy.num_replicas_in_sync):
-        get_value_fn = lambda ctx: (
-            tf.constant(reduce_random_mat, dtype=tf.float32),
-            tf.convert_to_tensor(images_aug_last[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32),
-            tf.convert_to_tensor(labels_aug_last[ctx.replica_id_in_sync_group + used_batch], dtype=tf.int32),
-            tf.convert_to_tensor(images_val_[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32),
-            tf.convert_to_tensor(labels_val_[ctx.replica_id_in_sync_group + used_batch], dtype=tf.int32),
-            tf.convert_to_tensor(weights_1[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32),
-            tf.constant(weights_2, dtype=tf.float32),
-        )
-        dist_values = mirrored_strategy.experimental_distribute_values_from_function(get_value_fn)
-        all_local_cos_sim_, all_local_grad_importance_ = distributed_train_stage1(dist_values)
-        all_local_cos_sim.extend(all_local_cos_sim_)
-        all_local_grad_importance.extend(all_local_grad_importance_)
+    # >>>
+    # assert (
+    #     search_bs % mirrored_strategy.num_replicas_in_sync == 0
+    # ), "Make sure that search_bs is multiples of mirrored_trategy"
+    # all_local_cos_sim, all_local_grad_importance = [], []
+    # for used_batch in range(0, search_bs, mirrored_strategy.num_replicas_in_sync):
+    #     get_value_fn = lambda ctx: (
+    #         tf.constant(reduce_random_mat, dtype=tf.float32), # ! [T, T], np.eye(T)
+    #         tf.convert_to_tensor(images_aug_last[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32), # ! [T, *img_size]
+    #         tf.convert_to_tensor(labels_aug_last[ctx.replica_id_in_sync_group + used_batch], dtype=tf.int32), # ! [T]
+    #         tf.convert_to_tensor(images_val_[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32), # ! [val_bs, *img_size]
+    #         tf.convert_to_tensor(labels_val_[ctx.replica_id_in_sync_group + used_batch], dtype=tf.int32), # ! [val_bs]
+    #         tf.convert_to_tensor(weights_1[ctx.replica_id_in_sync_group + used_batch], dtype=tf.float32), # ! [], = 1
+    #         tf.constant(weights_2, dtype=tf.float32), # ! [T], = p_theta
+    #     )
+    #     dist_values = mirrored_strategy.experimental_distribute_values_from_function(get_value_fn)
+    #     all_local_cos_sim_, all_local_grad_importance_ = distributed_train_stage1(dist_values) # ! ??, ??
+    #     all_local_cos_sim.extend(all_local_cos_sim_)
+    #     all_local_grad_importance.extend(all_local_grad_importance_)
+    # <<<
+    # 각 gpu가 자신이 할당받은 batch (search_bs)들에 대해서,
+    # for를 돌며 각 batch에 대한 all_local_cos_sim_, all_local_grad_importance_를 구함
+    # all_local_cos_sim : # ! ??
+    # all_local_grad_importance : # ! ??
+    # >>>
     grad_importance = tf.stack(all_local_grad_importance, axis=0)
     grad_importance = tf.reduce_mean(grad_importance, axis=0)
     mult_factor = 0.25
