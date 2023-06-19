@@ -1,36 +1,37 @@
-import os
-import logging
-import numpy as np
 import copy
-import random
 import datetime
+import logging
+import os
+import random
+
+import numpy as np
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import tensorflow as tf
+
 tf.get_logger().setLevel(logging.ERROR)
 
 
-from data_generator import DataGenerator, DataAugmentation
-from utils import CTLHistory
-from lr_scheduler import GradualWarmup_Cosine_Scheduler
-import resnet
-from resnet_imagenet import imagenet_resnet50
-
-from data_generator import get_cifar10_data, get_cifar100_data
-
-from augmentation import AutoContrast, Invert, Equalize, Solarize, Posterize, Contrast, Brightness, Sharpness, \
-    Identity, Color, ShearX, ShearY, TranslateX, TranslateY, Rotate
-from augmentation import RandCrop, RandCutout, RandFlip, RandCutout60
-from augmentation import RandResizeCrop_imagenet, centerCrop_imagenet
-
-
-from policy import DA_Policy_logits
-from augmentation import IMAGENET_SIZE
+import queue
+import threading
 
 import torch
-import threading
-import queue
+
+import resnet
+from augmentation import (IMAGENET_SIZE, AutoContrast, Brightness, Color,
+                          Contrast, Equalize, Identity, Invert, Posterize,
+                          RandCrop, RandCutout, RandCutout60, RandFlip,
+                          RandResizeCrop_imagenet, Rotate, Sharpness, ShearX,
+                          ShearY, Solarize, TranslateX, TranslateY,
+                          centerCrop_imagenet)
+from data_generator import (DataAugmentation, DataGenerator, get_cifar10_data,
+                            get_cifar100_data)
 from imagenet_data_utils import get_imagenet_split
+from lr_scheduler import GradualWarmup_Cosine_Scheduler
+from policy import DA_Policy_logits
+from resnet_imagenet import imagenet_resnet50
+from utils import CTLHistory
+
 
 def aug_op_cifar_list():  # oeprators and their ranges
     l = [
@@ -280,6 +281,10 @@ class PrefetchGenerator(threading.Thread):
 
     @staticmethod
     def sample_label_and_batch(dataset, bs, n_classes, MAX_iterations=100):
+        """
+        1. n_classes 중 랜덤하게 하나의 label을 고르고,
+        2. dataset에서 해당 label의 data를 bs개 만큼 랜덤하게 뽑아서 list형태로 반환
+        """
         for k in range(MAX_iterations):
             try:
                 lab = random.randint(0, n_classes-1)
@@ -295,11 +300,16 @@ class PrefetchGenerator(threading.Thread):
             images_val, labels_val, images_train, labels_train = [], [], [], []
             for _ in range(self.search_bs):
                 lab, imgs_val, labs_val = PrefetchGenerator.sample_label_and_batch(self.val_ds, self.val_bs, self.n_classes)
+                # ! int, val_bs개의 img list, val_bs개의 label list
                 imgs_train, labs_train = self.search_ds.sample_labeled_data_batch(lab, 1)
+                # ! 1, 1개의 img list, 1개의 label list
                 images_val.append(imgs_val)
                 labels_val.append(labs_val)
                 images_train.append(imgs_train)
                 labels_train.append(labs_train)
+            # ! =>
+            # ! images_val: [search_bs, val_bs]의 img 2차원 list (각 search batch들 안의 val_bs개의 img는 같은 label)
+            # ! images_train: [search_bs, 1]의 img 2차원 list (각 search batch들 안의 1개의 img는 같은 label)
             self.queue.put( (images_val, labels_val, images_train, labels_train) )
 
     def next(self):
